@@ -1,11 +1,11 @@
-BIN = server
-SRCS = server.c
+BIN = memod
+SRCS = memod.c server.c
 
 BIN1 = memop
-SRCS1 = publish.c client.c
+SRCS1 = memop.c client.c publish.c
 
 BIN2 = memos
-SRCS2 = subscribe.c client.c
+SRCS2 = memos.c client.c subscribe.c
 
 # LIBS = -lxmlp
 BUILDDIR = build

@@ -477,7 +477,7 @@ MemoServer* memo_start_server(char* port)
     return svr;
 }
 
-int memo_process_connections(MemoServer* server)
+int memo_process_server(MemoServer* server)
 {
     int          fdmax = 0;
     int          fd;
@@ -605,26 +605,4 @@ int memo_process_connections(MemoServer* server)
     }
 
     return 0;
-}
-
-int main(int argc, char** argv)
-{
-    MemoServer* server;
-    int         rv;
-
-    if (argc != 2)
-    {
-        fprintf(stderr, "usage: server port\n");
-        return 1;
-    }
-
-    if ((server = memo_start_server(argv[1])) == 0)
-        return 1;
-
-    printf("server: waiting for connections...\n");
-
-    rv = memo_process_connections(server);
-    memo_free_server(server);
-
-    return rv;
 }

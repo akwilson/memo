@@ -32,7 +32,7 @@ void* memo_connect_subscriber(char* host, char* port, char* topic)
     return subs;
 }
 
-int memo_receive_msg(MemoSubscriber* subscriber, char** msg, int* len)
+int memo_subscribe(MemoSubscriber* subscriber, char** msg, int* len)
 {
     uint32_t msg_len_u;
     int      msg_len;
@@ -69,36 +69,6 @@ int memo_receive_msg(MemoSubscriber* subscriber, char** msg, int* len)
         fprintf(stderr, "Connection to server lost\n");
         return 1;
     }
-
-    return 0;
-}
-
-int main(int argc, char *argv[])
-{
-    MemoSubscriber* subscriber;
-    int             len;
-    char*           msg;
-
-    if (argc != 4)
-    {
-        fprintf(stderr,"usage: memos hostname port topic\n");
-        return 1;
-    }
-
-    if ((subscriber = memo_connect_subscriber(argv[1], argv[2], argv[3])) == 0)
-        return 1;
-
-    while (memo_receive_msg(subscriber, &msg, &len) == 0)
-    {
-        if (strcmp(msg, "quit") == 0)
-        {
-            printf("memos: quit command received.  Exiting...\n");
-            break;
-        }
-        printf("client: received '%s' len=%d\n", msg, len);
-    }
-
-    memo_free_subscriber(subscriber);
 
     return 0;
 }
