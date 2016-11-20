@@ -26,6 +26,7 @@ static char* read_file(char* path)
     return fd;
 }
 
+// Entry point for memop -- publish messages to the Memo server.
 int main(int argc, char* argv[])
 {
     void* publisher;

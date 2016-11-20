@@ -23,6 +23,8 @@ static int mk_msg(int len, char* msg, char* topic, char** buf)
     return HEADER_LEN + topic_len + 1 + len;
 }
 
+// Waits for an acknowledgement response from the server to indicate
+// that the message was received by the server.
 static int await_ack(MemoPublisher* publisher)
 {
     int  rcvd;
@@ -58,6 +60,7 @@ void memo_free_publisher(MemoPublisher* pubs)
     free(pubs);
 }
 
+// Establishes a new publisher connection to a Memo server listening on the given host / port.
 void* memo_connect_publisher(char* host, char* port)
 {
     int sockfd;
@@ -72,6 +75,7 @@ void* memo_connect_publisher(char* host, char* port)
     return pubs;
 }
 
+// Publishes a message on the given topic to the connected Memo server.
 int memo_publish(MemoPublisher* publisher, char* topic, char* msg, int len)
 {
     int   sent = 0;

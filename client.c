@@ -12,6 +12,10 @@ static void* get_in_addr(struct sockaddr* sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+// Writes a message to a file descriptior representing a Memo server. Loops if
+// neccessary until the whole message is sent.
+// msg is the message to be sent, len the message length.
+// Returns the total number of bytes actually sent.
 static int send_msg(int socket, char* msg, int* len)
 {
     int   sent = 0;
@@ -31,6 +35,8 @@ static int send_msg(int socket, char* msg, int* len)
     return (rv == -1) ? 1 : 0;
 }
 
+// Sends a login message to the server to register a new connection. If the
+// client is a subscriber the topic should be not null.
 static int server_login(int sockfd, char* topic)
 {
     char data[LOGIN_LEN];
@@ -54,6 +60,8 @@ static int server_login(int sockfd, char* topic)
     return send_msg(sockfd, data, &len);
 }
 
+// Establishes a new client connection to the Memo server on host / port. If
+// topic is not null a subscriber connection is made, otherwise a publisher.
 int connect_client(char* host, char* port, char* topic)
 {
     int              sockfd;
@@ -73,7 +81,7 @@ int connect_client(char* host, char* port, char* topic)
         return -1;
     }
 
-    // loop through all the results and connect to the first we can
+    // Loop through all the results and connect to the first we can
     for (p = servinfo; p != NULL; p = p->ai_next)
     {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)

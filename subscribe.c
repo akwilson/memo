@@ -17,6 +17,8 @@ void memo_free_subscriber(MemoSubscriber* subs)
     free(subs);
 }
 
+// Establishes a new subscriber connection for the given topic to a Memo server
+// listening on the given host / port.
 void* memo_connect_subscriber(char* host, char* port, char* topic)
 {
     int sockfd;
@@ -32,6 +34,7 @@ void* memo_connect_subscriber(char* host, char* port, char* topic)
     return subs;
 }
 
+// Listen for messages from the connected Memo server. Blocks until a message is received.
 int memo_subscribe(MemoSubscriber* subscriber, char** msg, int* len)
 {
     uint32_t msg_len_u;

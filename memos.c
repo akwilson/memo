@@ -2,6 +2,7 @@
 #include <string.h>
 #include "memo.h"
 
+// Entry point for memos -- a subscriber to the Memo server.
 int main(int argc, char* argv[])
 {
     void* subscriber;

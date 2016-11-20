@@ -15,7 +15,7 @@ typedef struct
     int   senders; // number of MessagePtrs trying to send
 } MessageData;
 
-// Linked list of outstanding MessageDatas to be transferred
+// Linked list of outstanding MessageData objects to be transferred
 typedef struct _MessagePtr
 {
     MessageData*        data;
@@ -35,6 +35,7 @@ typedef struct _Subscriber
     struct _Subscriber* next;
 } Subscriber;
 
+// A connected publisher
 typedef struct _Publisher
 {
     int                fd;
@@ -44,6 +45,7 @@ typedef struct _Publisher
     struct _Publisher* next;
 } Publisher;
 
+// The server struct with lists of subscribers and publishers and the listening fd
 typedef struct
 {
     int         listener;
@@ -51,9 +53,9 @@ typedef struct
     Publisher*  publishers;
 } MemoServer;
 
+// Gets the IP address, either IPv4 or IPv6
 static void* get_in_addr(struct sockaddr* sa)
 {
-    // get sockaddr, IPv4 or IPv6:
     if (sa->sa_family == AF_INET)
     {
         return &(((struct sockaddr_in*)sa)->sin_addr);
@@ -62,6 +64,9 @@ static void* get_in_addr(struct sockaddr* sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
+// Reads the login information from a newly connected client. Returns a value to indicate
+// if the client is a publisher or a subscriber. The login_data contains the client's
+// username and, for subscribers, the topic.
 static int get_login(int fd, char** login_data)
 {
     // for now, assumes that recv() reads the whole login message
@@ -85,6 +90,7 @@ static int get_login(int fd, char** login_data)
     return ntohl(*type);
 }
 
+// Reads the topic from a message sent by a publisher.
 static void parse_topic(MessageData* md)
 {
     // get the topic.  TODO do this properly
@@ -98,6 +104,7 @@ static void parse_topic(MessageData* md)
     *(md->topic + tl) = 0;
 }
 
+// Sets up a new message to be transferred.
 static MessagePtr* init_message(Publisher* ptr, uint32_t msg_len_u)
 {
     MessagePtr* mp = ptr->cur_msg;
@@ -120,6 +127,9 @@ static MessagePtr* init_message(Publisher* ptr, uint32_t msg_len_u)
     return mp;
 }
 
+// Reads a chunk of message from a publisher. Populates msg_data.
+// Returns 1 to indicate that there is more still to be transferred. 0 indicates
+// that message transfer is complete. -1 indicates an error.
 static int new_message(Publisher* pub, MessageData** msg_data)
 {
     MessagePtr* mptr = pub->cur_msg;
@@ -176,6 +186,8 @@ static int new_message(Publisher* pub, MessageData** msg_data)
     return 0;
 }
 
+// Sends an acknowledgement message to the publisher to indicate
+// that the message was successfully sent.
 static int send_ack(Publisher* pub)
 {
     if ((send(pub->fd, "P_ACK", 5, 0)) == -1)
@@ -186,6 +198,8 @@ static int send_ack(Publisher* pub)
     return 0;
 }
 
+// Sets up a new client connection, publisher or subscriber.
+// Returns 0 if in error, or a value to indicate if the client is a subscriber or publisher.
 static int new_client(MemoServer* server, int new_fd)
 {
     struct sockaddr addr;
@@ -246,8 +260,10 @@ static void free_message(MessageData* md)
     free(md);
 }
 
-// init a new MessagePtr, point it to the MessageData and
-// add it to the tail of the Subscriber's MessagePtr list
+// Initialise a new MessagePtr, point it to the MessageData and add it to the
+// tail of the Subscriber's MessagePtr list. A message is sent to the subscriber one block
+// at a time; the subscriber's MessagePtr keeps track of how far through the message
+// this subscriber has got.
 static void prepare_send(Subscriber* subs, MessageData* md)
 {
     MessagePtr* mptr = (MessagePtr*)malloc(sizeof(MessagePtr));
@@ -265,6 +281,7 @@ static void prepare_send(Subscriber* subs, MessageData* md)
     subs->last_msg = mptr;
 }
 
+// Returns the subscriber on the given file descriptor
 static Subscriber* get_subscriber(MemoServer* server, int fd)
 {
     Subscriber* ptr;
@@ -276,6 +293,7 @@ static Subscriber* get_subscriber(MemoServer* server, int fd)
     return 0;
 }
 
+// Returns the publisher on the given file descriptor
 static Publisher* get_publisher(MemoServer* server, int fd)
 {
     Publisher* ptr;
@@ -287,6 +305,7 @@ static Publisher* get_publisher(MemoServer* server, int fd)
     return 0;
 }
 
+// Sends the next block of data for this subscriber. Moves the MessagePtr along to the next block.
 static int send_msg(Subscriber* subs)
 {
     int          bytes;
@@ -332,6 +351,8 @@ static int send_msg(Subscriber* subs)
     return 0;
 }
 
+// Receives a connection from a client. Gets its IP address
+// and returns a new file descriptor for it.
 static int handshake(MemoServer* server)
 {
     int                     new_fd;
@@ -357,6 +378,7 @@ static void free_publisher(Publisher* pub)
     free(pub);
 }
 
+// Removes publisher from the server when it has completed a publish request.
 static void remove_publisher(MemoServer* server, Publisher* pub)
 {
     Publisher** pub_ptr;
@@ -376,6 +398,7 @@ static void remove_publisher(MemoServer* server, Publisher* pub)
     }
 }
 
+// Frees up a disconnected subscriber.
 static void free_subscriber(Subscriber* sub)
 {
     MessagePtr* mp;
@@ -395,6 +418,7 @@ static void free_subscriber(Subscriber* sub)
     free(sub);
 }
 
+// Frees up a Memo server and all of its publishers
 void memo_free_server(MemoServer* server)
 {
     Subscriber* ptr;
@@ -410,6 +434,7 @@ void memo_free_server(MemoServer* server)
     free(server);
 }
 
+// Initialises a new Memo server on the given port.
 MemoServer* memo_start_server(char* port)
 {
     int              sockfd;
@@ -430,7 +455,7 @@ MemoServer* memo_start_server(char* port)
         return 0;
     }
 
-    // loop through all the results and bind to the first we can
+    // Loop through all the results and bind to the first we can
     for (p = servinfo; p != NULL; p = p->ai_next)
     {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
@@ -477,6 +502,7 @@ MemoServer* memo_start_server(char* port)
     return svr;
 }
 
+// Processes publish and subscribe events for the Memo server.
 int memo_process_server(MemoServer* server)
 {
     int          fdmax = 0;
@@ -493,6 +519,7 @@ int memo_process_server(MemoServer* server)
     FD_ZERO(&next_readfds);
     FD_ZERO(&next_writefds);
 
+    // The main event loop
     while (1)
     {
         fd_set readfds;
@@ -517,13 +544,14 @@ int memo_process_server(MemoServer* server)
 
         for (fd = 0; fd <= fdmax; fd++)
         {
+            // Process the read file descriptiors: messages from publishers and new connections
             if (FD_ISSET(fd, &readfds))
             {
                 if (fd == server->listener) // Handle new connections
                 {
                     if ((new_fd = handshake(server)) != -1)
                     {
-                        // prepare to receive login details
+                        // Prepare to receive login details
                         FD_SET(new_fd, &next_readfds);
                         next_fdm = MAX(next_fdm, new_fd);
                     }
@@ -564,6 +592,7 @@ int memo_process_server(MemoServer* server)
                 }
             }
 
+            // Process write descriptors: subscribers awaiting more data and publisher acknowledgements
             if (FD_ISSET(fd, &writefds))
             {
                 if (sub_ptr = get_subscriber(server, fd))
@@ -597,6 +626,7 @@ int memo_process_server(MemoServer* server)
             }
         }
 
+        // Add all publishers to the read file descriptor set
         for (pub_ptr = server->publishers; pub_ptr; pub_ptr = pub_ptr->next)
         {
             FD_SET(pub_ptr->fd, &next_readfds);
