@@ -22,10 +22,11 @@ int main(int argc, char* argv[])
 
     while (memo_subscribe(subscriber, &msg, &len) == 0)
     {
-        if (strcmp(msg, "quit") == 0)
+        char* ptr = strchr(msg, ':') + 1;
+        if (strcmp(ptr, "quit") == 0)
         {
             printf("memos: quit command received.  Exiting...\n");
-            break;
+            return 0;
         }
 
         printf("memos: received '%s' len=%d\n", msg, len);
