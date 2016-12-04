@@ -25,11 +25,11 @@ int main(int argc, char* argv[])
         char* ptr = strchr(msg, ':') + 1;
         if (strcmp(ptr, "quit") == 0)
         {
-            printf("memos: quit command received.  Exiting...\n");
+            printf("Quit command received. Exiting...\n");
             return 0;
         }
 
-        printf("memos: received '%s' len=%d\n", msg, len);
+        printf("Received: {%s} Len:%d\n", msg, len);
     }
 
     memo_free_subscriber(subscriber);

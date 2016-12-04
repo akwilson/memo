@@ -61,7 +61,6 @@ int memo_subscribe(MemoSubscriber* subscriber, char** msg, int* len)
                 return 1;
             }
             received += numbytes;
-            printf("client: read %d bytes\n", received);
         } while (received < msg_len);
 
         (*msg)[msg_len] = 0;

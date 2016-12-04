@@ -107,7 +107,6 @@ int connect_client(char* host, char* port, char* topic)
     }
 
     inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
-    printf("Connecting to %s\n", s);
 
     freeaddrinfo(servinfo); // all done with this structure
 
