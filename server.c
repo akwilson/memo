@@ -1,60 +1,212 @@
+#include <stddef.h>
+
+#include "logging.h"
 #include "memo_int.h"
 
-#define BACKLOG 10                  // how many pending connections queue will hold
-#define MAX(x,y) ((x) > (y) ? (x) : (y))
+#define BACKLOG 10 // Number of pending connections the queue will hold.
+#define QUEUE_DEPTH 256
+#define MSG_QUEUE_SIZE 32
+#define TOPIC_LEN 64
+#define MSG_HEADER_LEN (4 + 1 + TOPIC_LEN)
+#define DEFAULT_MSG_LEN 4096
+#define PARTIAL_MSG_LEN 72
 
-// TODO map of topic->subscribers; map of fd->publisher & fd->subscriber
-// TODO remove clients from the list when they close...
+#define max(x,y) ((x) > (y) ? (x) : (y))
+#define msg_len(b) (*((uint32_t *)(b)))
+#define slice_len(s) ((s).end - (s).start)
 
-// Message to be sent to subscribers
+/**
+ * The current state of a connection represents what it
+ * was doing when it returns from the io_uring.
+ */
+typedef enum
+{
+    CONN_ACCEPT,
+    CONN_READ,
+    CONN_WRITE
+} conn_state_e;
+
+/**
+ * Messages incoming or outgoing are of one of these types.
+ */
+enum
+{
+    OP_PUBLISH   = 0x01,
+    OP_SUBSCRIBE = 0x02,
+    OP_ADMIN     = 0x04,
+    OP_CLOSE     = 0x08
+};
+
+/**
+ * An incomming message from a client process.
+ */
 typedef struct
 {
-    char* msg;     // encoded message
-    char  topic[32];
-    int   tot_len; // length of encoded message
-    int   senders; // number of MessagePtrs trying to send
-} MessageData;
+    size_t  len;
+    uint8_t buf[];
+} data_buffer_s;
 
-// Linked list of outstanding MessageData objects to be transferred
-typedef struct _MessagePtr
-{
-    MessageData*        data;
-    int                 transferred; // number of bytes transferred so far for this client
-    struct _MessagePtr* next;
-} MessagePtr;
-
-// A connected subscriber
-typedef struct _Subscriber
-{
-    int                 fd;
-    struct sockaddr     address;
-    char                topic[16];
-    char                username[16];
-    MessagePtr*         cur_msg;      // outstanding messages
-    MessagePtr*         last_msg;
-    struct _Subscriber* next;
-} Subscriber;
-
-// A connected publisher
-typedef struct _Publisher
-{
-    int                fd;
-    struct sockaddr    address;
-    char               username[16];
-    MessagePtr*        cur_msg;
-    struct _Publisher* next;
-} Publisher;
-
-// The server struct with lists of subscribers and publishers and the listening fd
+/**
+ * A slice of data within a `data_buffer_s`.
+ */
 typedef struct
 {
-    int         listener;
-    Subscriber* subscribers;
-    Publisher*  publishers;
-} MemoServer;
+    uint8_t *start;
+    uint8_t *end;
+} data_buffer_slice_s;
 
-// Gets the IP address, either IPv4 or IPv6
-static void* get_in_addr(struct sockaddr* sa)
+/**
+ * A fixed format message sent to Memo from a client.
+ */
+typedef struct message
+{
+    // Header
+    uint32_t msg_size;         // total message size including the header
+    uint8_t  type;             // if the message is a publish, subscribe or something else
+    char     topic[TOPIC_LEN]; // the message topic
+    // Body
+    uint8_t  body[];           // the message to be published, unset for subscriptions
+} message_s;
+
+/**
+ * A message queue for messages pending write on a
+ * connection. Implemented as a ring buffer.
+ */
+typedef struct message_queue
+{
+    unsigned      write;
+    unsigned      read;
+    data_buffer_s *data[MSG_QUEUE_SIZE];
+} message_queue_s;
+
+typedef struct connection connection_s;
+
+/**
+ * The `user_data` reference on the io_uring. We get this back on the CQE from io_uring and
+ * from here we can tell if the response we need to process is an accept, read or write.
+ */
+typedef struct op_context
+{
+    conn_state_e state;
+    connection_s *conn;
+} op_context_s;
+
+/**
+ * An external connection from a Memo client.
+ */
+struct connection
+{
+    int               socket;
+
+    data_buffer_s     *read_buf;
+    size_t            bytes_r;
+    data_buffer_s     *write_buf;
+    uint32_t          bytes_w;
+
+    op_context_s      accept_op;
+    op_context_s      read_op;
+    op_context_s      write_op;
+
+    message_queue_s   *mq;
+
+    struct connection *next_s; // linked list for the subscription
+    struct connection *next_r; // linked list for the server
+};
+
+/**
+ * Connections subscribing to a given topic.
+ */
+typedef struct subscription
+{
+    char                topic[TOPIC_LEN];
+    connection_s        *connections;
+    struct subscription *next;
+} subscription_s;
+
+struct memo_server
+{
+    int             listener;
+    struct io_uring *ring;
+    connection_s    *connections;
+    subscription_s  *subscriptions;
+};
+
+/**
+ * Adds a data buffer to the message queue.
+ *
+ * @param `mq`  the message queue to add to.
+ * @param `buf` the buffer to enqueue.
+ *
+ * @returns `true` if the buffer was successfully enqueued, `false` if the queue is already full.
+ */
+static bool msg_queue_push(message_queue_s *mq, data_buffer_s *buf)
+{
+    size_t next_head = (mq->write + 1) % MSG_QUEUE_SIZE;
+    if (next_head == mq->read)
+    {
+        // Queue is full
+        return false;
+    }
+
+    mq->data[mq->write] = buf;
+    mq->write = next_head;
+    return true;
+}
+
+/**
+ * Pops the next item off the end of the message queue.
+ *
+ * @param 'mq' the message queue to read from.
+ *
+ * @returns the next buffer in the queue, NULL if the queue is empty.
+ */
+static data_buffer_s *msg_queue_pop(message_queue_s *mq)
+{
+    if (mq->read == mq->write)
+    {
+        // Queue is empty
+        return NULL;
+    }
+
+    data_buffer_s *rv = mq->data[mq->read];
+    mq->data[mq->read] = NULL;
+    mq->read = (mq->read + 1) % MSG_QUEUE_SIZE;
+    return rv;
+}
+
+
+static void free_subscription(subscription_s *sub)
+{
+    free(sub->topic);
+    free(sub);
+}
+
+static void free_connection(connection_s *conn)
+{
+    close(conn->socket);
+    free(conn->mq);
+    free(conn);
+}
+
+static void print_message(message_s *message)
+{
+    log_debug("size: %d", message->msg_size);
+    log_debug("type: %s", message->type == OP_PUBLISH ? "Publish" : "Subscribe");
+    log_debug("topic: %s", message->topic);
+    if (message->type == OP_PUBLISH)
+    {
+        unsigned body_len = message->msg_size - MSG_HEADER_LEN;
+        if (body_len < 64)
+            log_debug("body: %.*s", body_len, (char *)message->body);
+        else
+            log_debug("body: %.*s...", 64, (char *)message->body);
+    }
+}
+
+/**
+ * Gets the IP address, either IPv4 or IPv6.
+ */
+static void *get_in_addr(struct sockaddr *sa)
 {
     if (sa->sa_family == AF_INET)
     {
@@ -64,385 +216,383 @@ static void* get_in_addr(struct sockaddr* sa)
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
 }
 
-// Reads the login information from a newly connected client. Returns a value to indicate
-// if the client is a publisher or a subscriber. The login_data contains the client's
-// username and, for subscribers, the topic.
-static int get_login(int fd, char** login_data)
+/**
+ * Sets up the connection with the socket details and logs some connection details.
+ */
+static void initialise_connection(connection_s *conn, int socket, struct sockaddr_storage *their_addr)
 {
-    // for now, assumes that recv() reads the whole login message
-    // should probably feed back to select() instead...
-    static char data[LOGIN_LEN];
-    char*       delim;
-    int         numbytes;
-    uint32_t*   type;
+    char s[INET6_ADDRSTRLEN];
 
-    if ((numbytes = recv(fd, data, LOGIN_LEN, 0)) == -1)
-    {
-        perror("get_login");
-        return 1;
-    }
-    *(data + numbytes) = 0;
+    conn->socket = socket;
+    conn->read_buf = calloc(1, sizeof(data_buffer_s) + DEFAULT_MSG_LEN);
+    conn->read_buf->len = DEFAULT_MSG_LEN;
 
-    type = (uint32_t*)data;
-
-    *login_data = (char*)(type + 1);
-
-    return ntohl(*type);
+    inet_ntop(their_addr->ss_family, get_in_addr((struct sockaddr *)their_addr), s, sizeof s);
+    log_info("Accepted connection %d from %s", socket, s);
 }
 
-// Reads the topic from a message sent by a publisher.
-static void parse_topic(MessageData* md)
+/**
+ * Parses out a `message_s` from a `read_buffer_slice_s`. Assumes
+ * that the slice contains a complete message.
+ */
+static message_s *parse_msg(data_buffer_slice_s slice)
 {
-    // get the topic.  TODO do this properly
-    char* ptr;
-    char* ts = md->msg + 4;
-    int   tl;
+    uint32_t msg_size = *((uint32_t *)slice.start);
+    message_s *rv = malloc(sizeof(message_s) + msg_size);
+    rv->msg_size = msg_size;
 
-    ptr = strchr(ts, ':');
-    tl = ptr - ts;
-    memcpy(md->topic, ts, tl);
-    *(md->topic + tl) = 0;
+    size_t offset = sizeof(uint32_t);
+    rv->type = *((uint8_t *)(slice.start + offset));
+
+    offset += sizeof(uint8_t);
+    memcpy(&rv->topic, slice.start + offset, TOPIC_LEN);
+
+    offset += TOPIC_LEN;
+    memcpy(&rv->body, slice.start + offset, msg_size - offset);
+    return rv;
 }
 
-// Sets up a new message to be transferred.
-static MessagePtr* init_message(Publisher* ptr, uint32_t msg_len_u)
+/**
+ * Writes a message out to a contiguous buffer ready for sending over the wire.
+ */
+static data_buffer_s *pack_msg(message_s *msg)
 {
-    MessagePtr* mp = ptr->cur_msg;
-    int         msg_len;
+    data_buffer_s *rv = malloc(sizeof(data_buffer_s) + msg->msg_size);
+    rv->len = msg->msg_size;
+    memcpy(rv->buf, &msg->msg_size, sizeof(uint32_t));
 
-    msg_len = ntohl(msg_len_u);
+    size_t offset = sizeof(uint32_t);
+    memcpy(rv->buf + offset, &msg->type, sizeof(uint8_t));
 
-    if (mp == 0)
-    {
-        mp = (MessagePtr*)malloc(sizeof(MessagePtr));
-        ptr->cur_msg = mp;
-    }
+    offset += sizeof(uint8_t);
+    memcpy(rv->buf + offset, msg->topic, TOPIC_LEN);
 
-    mp->data = (MessageData*)malloc(sizeof(MessageData));
-    mp->data->senders = 0;
-    mp->data->msg = (char*)malloc(msg_len + HEADER_LEN);
-    memcpy(mp->data->msg, &msg_len_u, HEADER_LEN);
-    mp->data->tot_len = msg_len + HEADER_LEN;
-    mp->transferred = HEADER_LEN;
-    return mp;
+    offset += TOPIC_LEN;
+    memcpy(rv->buf + offset, msg->body, msg->msg_size - offset);
+    return rv;
 }
 
-// Reads a chunk of message from a publisher. Populates msg_data.
-// Returns 1 to indicate that there is more still to be transferred. 0 indicates
-// that message transfer is complete. -1 indicates an error.
-static int new_message(Publisher* pub, MessageData** msg_data)
+/**
+ * Sets up an accept request in the io_uring submission queue in
+ * preparation for establishing new client connections.
+ */
+static void prepare_accept(memo_server_s *server, struct sockaddr_storage *their_addr, socklen_t *their_addr_len)
 {
-    MessagePtr* mptr = pub->cur_msg;
-    int         numbytes;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(server->ring);
+    io_uring_prep_accept(sqe, server->listener, (struct sockaddr *)their_addr,
+                         their_addr_len, SOCK_NONBLOCK);
 
-    *msg_data = 0;
+    connection_s *conn = calloc(1, sizeof(connection_s));
+    conn->next_r = server->connections;
+    server->connections = conn;
 
-    // Start of published message
-    if ((mptr == 0) || (mptr->data == 0))
-    {
-        uint32_t msg_len_u;
+    conn->accept_op.conn = conn;
+    conn->accept_op.state = CONN_ACCEPT;
+    conn->mq = calloc(1, sizeof(message_queue_s));
 
-        switch (numbytes = recv(pub->fd, &msg_len_u, HEADER_LEN, 0))
-        {
-        case -1:
-            perror("new_message read_1");
-            return -1;
-        case 0:
-            fprintf(stderr, "Connection to publisher closed\n");
-            return -1;
-        default:
-            mptr = init_message(pub, msg_len_u);
-            break;
-        }
-    }
-
-    // The rest of the message
-    switch (numbytes = recv(pub->fd, mptr->data->msg + mptr->transferred,
-                         mptr->data->tot_len - mptr->transferred, 0))
-    {
-    case -1:
-        perror("receive_msg read_2");
-        return -1;
-    case 0:
-        fprintf(stderr, "Connection to publisher closed\n");
-        return -1;
-    default:
-        mptr->transferred += numbytes;
-        printf("server: publish read %d bytes\n", mptr->transferred);
-
-        if (mptr->transferred < mptr->data->tot_len)
-        {
-            return 1; // More data to come
-        }
-        else
-        {
-            parse_topic(mptr->data);
-            pub->cur_msg = 0;
-            *msg_data = mptr->data;
-        }
-        break;
-    }
-
-    return 0;
+    log_info("Preparing to accept");
+    io_uring_sqe_set_data(sqe, &conn->accept_op);
+    io_uring_submit(server->ring);
 }
 
-// Sends an acknowledgement message to the publisher to indicate
-// that the message was successfully sent.
-static int send_ack(Publisher* pub)
+/**
+ * Helper function to prepare a recv call on the io uring.
+ */
+static void prepare_recv(memo_server_s *server, connection_s *conn, void *buf, size_t length)
 {
-    if ((send(pub->fd, "P_ACK", 5, 0)) == -1)
-    {
-        perror("send_ack");
-        return 1;
-    }
-    return 0;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(server->ring);
+
+    conn->read_op.conn = conn;
+    conn->read_op.state = CONN_READ;
+
+    log_info("Preparing to read %ld bytes on client %d", length, conn->socket);
+    io_uring_prep_recv(sqe, conn->socket, buf, length, 0);
+    io_uring_sqe_set_data(sqe, &conn->read_op);
+    io_uring_submit(server->ring);
 }
 
-// Sets up a new client connection, publisher or subscriber.
-// Returns 0 if in error, or a value to indicate if the client is a subscriber or publisher.
-static int new_client(MemoServer* server, int new_fd)
+/**
+ * Enqueues a read request for the default message size worth of data from the
+ * connection. This includes a message header and a bit of extra room for a message
+ * body. If the whole message fails to fit within this block we will enqueue another
+ * read for what remains.
+ */
+static void read_from_start(memo_server_s *server, connection_s *conn)
 {
-    struct sockaddr addr;
-    socklen_t       sin_size = sizeof(addr);
-    char*           login_data;
-    char*           delim;
+    conn->bytes_r = 0;
+    prepare_recv(server, conn, conn->read_buf->buf, DEFAULT_MSG_LEN); // TODO: should DEFAULT_MSG_LEN be buf->len?
+}
 
-    if (getpeername(new_fd, &addr, &sin_size))
+/**
+ * Checks the environment to see if we are forcing partial writes. Useful for testing
+ * and debugging.
+ */
+static bool get_env_partial_writes()
+{
+    static const char *pw = NULL;
+    if (pw == NULL)
     {
-        perror("new_subscriber");
-        return 0;
+        const char *env = getenv("MEMO_PARTIAL_WRITE");
+        pw = (env != NULL) ? env : "N";
     }
-    fcntl(new_fd, F_SETFL, O_NONBLOCK);
 
-    if (get_login(new_fd, &login_data) == CL_SUBSCRIBER)
+    return pw[0] == 'Y';
+}
+
+/**
+ * Helper function to prepare a send over the io uring.
+ */
+static void prepare_write(memo_server_s *server, connection_s *dest, void *buf, size_t length)
+{
+    static bool do_partial_writes = false;
+    struct io_uring_sqe *sqe = io_uring_get_sqe(server->ring);
+
+    dest->write_op.conn = dest;
+    dest->write_op.state = CONN_WRITE;
+
+    if (get_env_partial_writes())
     {
-        Subscriber* subs = (Subscriber*)malloc(sizeof(Subscriber));
-        subs->next = server->subscribers;
-        server->subscribers = subs;
-
-        subs->fd = new_fd;
-
-        delim = strchr(login_data, '|');
-        *delim++ = 0;
-        strcpy(subs->username, login_data);
-        strcpy(subs->topic, delim);
-
-        subs->cur_msg = 0;
-        subs->last_msg = 0;
-
-        subs->address = addr;
-
-        printf("server: subscriber login: username=%s topic=%s\n", subs->username, subs->topic);
-        return CL_SUBSCRIBER;
+        length = length > PARTIAL_MSG_LEN ? PARTIAL_MSG_LEN : length;
+        log_info("Preparing partial write %ld bytes to client %d", length, dest->socket);
     }
     else
     {
-        Publisher* pubs = (Publisher*)malloc(sizeof(Publisher));
-        pubs->next = server->publishers;
-        server->publishers = pubs;
-
-        pubs->cur_msg = 0;
-
-        pubs->fd = new_fd;
-
-        strcpy(pubs->username, login_data);
-
-        pubs->address = addr;
-
-        printf("server: publisher login: username=%s\n", pubs->username);
-        return CL_PUBLISHER;
+        log_info("Preparing to write %ld bytes to client %d", length, dest->socket);
     }
+
+    io_uring_prep_write(sqe, dest->socket, buf, length, 0);
+    io_uring_sqe_set_data(sqe, &dest->write_op);
+    io_uring_submit(server->ring);
 }
 
-static void free_message(MessageData* md)
+/**
+ * Finds the subscription_s for the given topic.
+ *
+ * @returns The subscription_s if found, NULL otherwise.
+ */
+static subscription_s *find_subscription(memo_server_s *server, const char *topic)
 {
-    free(md->msg);
-    free(md);
-}
-
-// Initialise a new MessagePtr, point it to the MessageData and add it to the
-// tail of the Subscriber's MessagePtr list. A message is sent to the subscriber one block
-// at a time; the subscriber's MessagePtr keeps track of how far through the message
-// this subscriber has got.
-static void prepare_send(Subscriber* subs, MessageData* md)
-{
-    MessagePtr* mptr = (MessagePtr*)malloc(sizeof(MessagePtr));
-
-    md->senders++;
-
-    mptr->transferred = 0;
-    mptr->data = md;
-    mptr->next = 0;
-
-    if (subs->cur_msg == 0)
-        subs->cur_msg = mptr;
-    if (subs->last_msg)
-        subs->last_msg->next = mptr;
-    subs->last_msg = mptr;
-}
-
-// Returns the subscriber on the given file descriptor
-static Subscriber* get_subscriber(MemoServer* server, int fd)
-{
-    Subscriber* ptr;
-    for (ptr = server->subscribers; ptr; ptr = ptr->next)
+    subscription_s *sub;
+    for (sub = server->subscriptions; sub; sub = sub->next)
     {
-        if (ptr->fd == fd)
-            return ptr;
+	if (!memcmp(sub->topic, topic, TOPIC_LEN))
+	{
+	    break;
+	}
     }
-    return 0;
+
+    return sub;
 }
 
-// Returns the publisher on the given file descriptor
-static Publisher* get_publisher(MemoServer* server, int fd)
+/**
+ * Adds a new subscription to the server. A new subscription_s object
+ * is created if necessary and the connection registered as being interested
+ * in the topic. When messages appear on the topic they will be sent to
+ * each connection on the subscription.
+ */
+static void register_subscription(memo_server_s *server, connection_s *conn, const char *topic)
 {
-    Publisher* ptr;
-    for (ptr = server->publishers; ptr; ptr = ptr->next)
+    subscription_s *sub = find_subscription(server, topic);
+    if (!sub)
     {
-        if (ptr->fd == fd)
-            return ptr;
+        sub = calloc(1, sizeof(subscription_s));
+        memcpy(sub->topic, topic, TOPIC_LEN);
+
+        sub->next = server->subscriptions;
+        server->subscriptions = sub;
     }
-    return 0;
+
+    conn->next_s = sub->connections;
+    sub->connections = conn;
+
+    log_info("Connection %d subscribed to '%s'", conn->socket, topic);
 }
 
-// Sends the next block of data for this subscriber. Moves the MessagePtr along to the next block.
-static int send_msg(Subscriber* subs)
+/**
+ * Starts a publish operation on the next item in the connection_s's
+ * message queue. Does nothing if the queue is empty.
+ */
+static void dequeue_publish(memo_server_s *server, connection_s *conn)
 {
-    int          bytes;
-    MessagePtr*  cmsg = subs->cur_msg;
-    MessageData* md = cmsg->data;
+    data_buffer_s *data = msg_queue_pop(conn->mq);
+    if (data == NULL)
+        return;
 
-    bytes = send(subs->fd, md->msg + cmsg->transferred, md->tot_len - cmsg->transferred, 0);
-    if (bytes == -1)
+    conn->write_buf = data;
+    conn->bytes_w = 0;
+    prepare_write(server, conn, conn->write_buf->buf, conn->write_buf->len);
+}
+
+/**
+ * Publishes a message to any interested subscribers.
+ *
+ * @param `conn` the connection from which the message was received
+ * @param `msg`  the message to send to any interested subscribers
+ */
+static void publish_msg(memo_server_s *server, connection_s *conn, message_s *msg)
+{
+    subscription_s *sub = find_subscription(server, msg->topic);
+    if (!sub)
     {
-        if (errno == EAGAIN)
+        log_debug("No subscribers found for '%s', message dropped", msg->topic);
+        return;
+    }
+
+    data_buffer_s *data = pack_msg(msg);
+    for (connection_s *s = sub->connections; s; s = s->next_s)
+    {
+        if (!msg_queue_push(s->mq, data))
         {
-            printf("server: no send\n");
-            return 1;
+            log_warn("Message queue full on client %d. Message dropped.", s->socket);
+            continue;
         }
-        perror("send_msg");
-        return -1;
-    }
 
-    cmsg->transferred += bytes;
-    if (cmsg->transferred < md->tot_len)
-    {
-        printf("server: partial send. %d bytes sent\n", cmsg->transferred);
-        return 1;
-    }
-
-    // Send complete.  Ready next message for this subscriber
-    subs->cur_msg = subs->cur_msg->next;
-    if (subs->cur_msg == 0)
-    {
-        // No messages left to send, clear last ptr
-        subs->last_msg = 0;
-    }
-
-    free(cmsg);
-
-    // If no one else needs this message, free it
-    md->senders--;
-    if (md->senders == 0)
-    {
-        free_message(md);
-    }
-
-    return 0;
-}
-
-// Receives a connection from a client. Gets its IP address
-// and returns a new file descriptor for it.
-static int handshake(MemoServer* server)
-{
-    int                     new_fd;
-    struct sockaddr_storage their_addr;
-    socklen_t               sin_size = sizeof(their_addr);
-    char                    s[INET6_ADDRSTRLEN];
-
-    new_fd = accept(server->listener, (struct sockaddr*)&their_addr, &sin_size);
-    if (new_fd == -1)
-        perror("handshake");
-
-    inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr*)&their_addr), s, sizeof s);
-    printf("server: got connection from %s fd=%d\n", s, new_fd);
-
-    return new_fd;
-}
-
-static void free_publisher(Publisher* pub)
-{
-    close(pub->fd);
-    if (pub->cur_msg)
-        free(pub->cur_msg);
-    free(pub);
-}
-
-// Removes publisher from the server when it has completed a publish request.
-static void remove_publisher(MemoServer* server, Publisher* pub)
-{
-    Publisher** pub_ptr;
-    for (pub_ptr = &(server->publishers); *pub_ptr; )
-    {
-        if (*pub_ptr == pub)
-        {
-            (*pub_ptr) = pub->next;
-            free_publisher(pub);
-            if ((*pub_ptr) == 0)
-                break;
-        }
-        else
-        {
-            pub_ptr = &((*pub_ptr)->next);
-        }
+        if (s->write_buf == NULL)
+            dequeue_publish(server, s);
     }
 }
 
-// Frees up a disconnected subscriber.
-static void free_subscriber(Subscriber* sub)
+/**
+ * Processes a fully read message from a client connection.
+ */
+static void process_msg(memo_server_s *server, connection_s *conn, message_s *msg)
 {
-    MessagePtr* mp;
-
-    close(sub->fd);
-    for (mp = sub->cur_msg; mp; mp = sub->cur_msg)
+    print_message(msg);
+    switch (msg->type)
     {
-        if (mp)
-            sub->cur_msg = mp->next;
-
-        mp->data->senders--;
-        if (mp->data->senders == 0)
-            free_message(mp->data);
-        free(mp);
+    case OP_SUBSCRIBE:
+        register_subscription(server, conn, msg->topic);
+        break;
+    case OP_PUBLISH:
+        publish_msg(server, conn, msg);
+        break;
     }
 
-    free(sub);
+    //free(conn->message);
+    //conn->message = NULL;
+    //conn->msg_size = 0;
 }
 
-// Frees up a Memo server and all of its publishers
-void memo_free_server(MemoServer* server)
+/**
+ * Parses and processes any complete messages in the buffer.
+ *
+ * @returns the slice of data that contains an incomplete message
+ */
+static data_buffer_slice_s try_process_messages(memo_server_s *server, connection_s *conn, data_buffer_slice_s slice)
 {
-    Subscriber* ptr;
+    if (slice_len(slice) < HEADER_LEN || slice_len(slice) < msg_len(slice.start))
+        return slice;
 
-    for (ptr = server->subscribers; ptr; ptr = server->subscribers)
+    message_s *msg = parse_msg(slice);
+    process_msg(server, conn, msg);
+
+    data_buffer_slice_s next =
     {
-        if (ptr)
-            server->subscribers = ptr->next;
-        free_subscriber(ptr);
+        .start = slice.start + msg->msg_size,
+        .end = slice.end
+    };
+
+    return try_process_messages(server, conn, next);
+}
+
+/**
+ * The buffer from `recv` contains part of a message and needs to be handled.
+ *
+ * The three possible scenarios are:
+ * 1. A single message but one too large for the default allocated buffer.
+ * 2. A tiny bit of data too small for even a message header.
+ * 3. Several messages, the last of which does not fit within the allocated buffer.
+ *
+ * This function decides what to do with whatever is there. It will reallocate the
+ * buffer if it's not big enough or move the data back to the start of the buffer
+ * if it is (or the size in unknown).
+ *
+ * @param `server` the memo server instance
+ * @param `conn`   the connection, contains the buffer populated by `recv`
+ * @param `slice`  points to the unhandled data
+ *
+ * @returns the amount of data to request in the next `recv` call
+ */
+static size_t prepare_next_read(memo_server_s *server, connection_s *conn, data_buffer_slice_s slice)
+{
+    ptrdiff_t unhandled_len = slice_len(slice);
+
+    // Scenario 1: we're gonna need a bigger boat
+    if (unhandled_len > HEADER_LEN && msg_len(slice.start) > conn->read_buf->len)
+    {
+        size_t new_buf_len = max(msg_len(slice.start), DEFAULT_MSG_LEN);
+        data_buffer_s *new_buf = calloc(1, sizeof(data_buffer_s) + new_buf_len);
+        new_buf->len = new_buf_len;
+        memcpy(new_buf->buf, slice.start, msg_len(slice.start));
+        free(conn->read_buf);
+        conn->read_buf = new_buf;
+        conn->bytes_r = unhandled_len;
+        return msg_len(conn->read_buf->buf) - unhandled_len;
     }
 
-    close(server->listener);
-    free(server);
+    // Scenarios 2 and 3
+    if (slice.start > conn->read_buf->buf)
+    {
+        conn->bytes_r = unhandled_len;
+        memmove(conn->read_buf->buf, slice.start, unhandled_len);
+    }
+
+    return conn->read_buf->len - unhandled_len;
 }
 
-// Initialises a new Memo server on the given port.
-MemoServer* memo_start_server(char* port)
+/**
+ * Processes a message received from `recv`. Parses and processes any complete
+ * messages received and decides what to do with incomplete messages.
+ *
+ * @param `conn`       the connection with a populated buffer to process
+ * @param `bytes_read` the number of bytes in the buffer that were just populated
+ *
+ * @returns the number of bytes to read in the next `recv` call
+ */
+static size_t handle_read_response(memo_server_s *server, connection_s *conn, size_t bytes_read)
 {
-    int              sockfd;
-    int              yes = 1;
-    int              rv;
-    struct addrinfo  hints;
-    struct addrinfo* servinfo;
-    struct addrinfo* p;
+    conn->bytes_r += bytes_read;
+    data_buffer_slice_s slice =
+    {
+        .start = conn->read_buf->buf,
+        .end = conn->read_buf->buf + conn->bytes_r
+    };
+
+    data_buffer_slice_s remaining = try_process_messages(server, conn, slice);
+    return slice_len(remaining) ? prepare_next_read(server, conn, remaining) : 0;
+}
+
+/**
+ * Process the result of a send. Determines if we completed a partial write and
+ * another send call needs to be made or of the whole message has been sent completely.
+ *
+ * @param `conn`          the connection that just completed a send call
+ * @param `bytes_written` the number of bytes completed by the send call
+ *
+ * @returns the number of bytes to be sent in the next call, 0 if completed
+ */
+static size_t handle_write_response(memo_server_s *server, connection_s *conn, size_t bytes_written)
+{
+    conn->bytes_w += bytes_written;
+    if (conn->bytes_w == conn->write_buf->len)
+    {
+        log_info("Write %d completed on client %d", conn->bytes_w, conn->socket);
+        conn->write_buf = NULL;
+        conn->bytes_w = 0;
+        return 0;
+    }
+
+    return conn->write_buf->len - conn->bytes_w;
+}
+
+memo_server_s *memo_start_server(char *port)
+{
+    int             sockfd;
+    int             yes = 1;
+    int             rv;
+    struct addrinfo hints;
+    struct addrinfo *servinfo;
+    struct addrinfo *p;
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -451,8 +601,8 @@ MemoServer* memo_start_server(char* port)
 
     if ((rv = getaddrinfo(NULL, port, &hints, &servinfo)) != 0)
     {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-        return 0;
+        log_error("getaddrinfo: %s", gai_strerror(rv));
+        return NULL;
     }
 
     // Loop through all the results and bind to the first we can
@@ -460,30 +610,28 @@ MemoServer* memo_start_server(char* port)
     {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
         {
-            perror("server: socket");
             continue;
         }
 
         if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
         {
             perror("setsockopt");
-            return 0;
+            return NULL;
         }
 
-        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1)
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == 0)
         {
-            close(sockfd);
-            perror("server: bind");
-            continue;
+	    // Socket set up successfully.
+	    break;
         }
 
-        break;
+        close(sockfd);
     }
 
     if (p == NULL)
     {
-        fprintf(stderr, "server: failed to bind\n");
-        return 0;
+        log_error("server: failed to bind");
+        return NULL;
     }
 
     freeaddrinfo(servinfo);
@@ -491,148 +639,102 @@ MemoServer* memo_start_server(char* port)
     if (listen(sockfd, BACKLOG) == -1)
     {
         perror("listen");
-        return 0;
+        return NULL;
     }
 
-    MemoServer* svr = (MemoServer*)malloc(sizeof(MemoServer));
+    memo_server_s *svr = calloc(1, sizeof(memo_server_s));
     svr->listener = sockfd;
-    svr->subscribers = 0;
-    svr->publishers = 0;
-
+    svr->ring = malloc(sizeof(struct io_uring));
+    io_uring_queue_init(QUEUE_DEPTH, svr->ring, 0);
+    
     return svr;
 }
 
-// Processes publish and subscribe events for the Memo server.
-int memo_process_server(MemoServer* server)
+int memo_process_server(memo_server_s *server)
 {
-    int          fdmax = 0;
-    int          fd;
-    int          new_fd;
-    fd_set       next_readfds;
-    fd_set       next_writefds;
-    int          next_fdm = 0;
-    int          rv;
-    Subscriber*  sub_ptr;
-    Publisher*   pub_ptr;
-    MessageData* msg_data;
+    struct io_uring_cqe *cqe;
+    struct sockaddr_storage their_addr;
+    socklen_t their_addr_len = sizeof(their_addr);
 
-    FD_ZERO(&next_readfds);
-    FD_ZERO(&next_writefds);
+    prepare_accept(server, &their_addr, &their_addr_len);
 
-    // The main event loop
     while (1)
     {
-        fd_set readfds;
-        fd_set writefds;
-
-        readfds = next_readfds;
-        writefds = next_writefds;
-        fdmax = next_fdm;
-
-        FD_SET(server->listener, &readfds);
-        fdmax = MAX(fdmax, server->listener);
-
-        if ((select(fdmax + 1, &readfds, &writefds, 0, 0)) == -1)
+        int rv = io_uring_wait_cqe(server->ring, &cqe);
+        if (rv < 0)
         {
-            // TODO handle EAINT?
-            perror("select");
+            perror("io_uring_wait_cqe");
             return 1;
         }
 
-        FD_ZERO(&next_readfds);
-        FD_ZERO(&next_writefds);
-
-        for (fd = 0; fd <= fdmax; fd++)
+        op_context_s *ctx = (op_context_s *)cqe->user_data;
+        connection_s *conn = ctx->conn;
+        if (cqe->res < 0)
         {
-            // Process the read file descriptiors: messages from publishers and new connections
-            if (FD_ISSET(fd, &readfds))
-            {
-                if (fd == server->listener) // Handle new connections
-                {
-                    if ((new_fd = handshake(server)) != -1)
-                    {
-                        // Prepare to receive login details
-                        FD_SET(new_fd, &next_readfds);
-                        next_fdm = MAX(next_fdm, new_fd);
-                    }
-                }
-                else
-                {
-                    if (pub_ptr = get_publisher(server, fd))
-                    {
-                        if ((rv = new_message(pub_ptr, &msg_data)) == 0)
-                        {
-                            // Now that we have something to send, prepare the
-                            // relevant subscribers for the next call to select()
-                            for (sub_ptr = server->subscribers; sub_ptr; sub_ptr = sub_ptr->next)
-                            {
-                                if ((strcmp(sub_ptr->topic, msg_data->topic)) == 0)
-                                {
-                                    prepare_send(sub_ptr, msg_data);
-                                    FD_SET(sub_ptr->fd, &next_writefds);
-                                    next_fdm = MAX(next_fdm, sub_ptr->fd);
-                                }
-                            }
-                            if (msg_data->senders == 0)
-                                free_message(msg_data);
-
-                            // Prepare to send ACK to Publisher
-                            FD_SET(fd, &next_writefds);
-                            next_fdm = MAX(next_fdm, fd);
-                        }
-                        if (rv == -1)
-                            remove_publisher(server, pub_ptr);
-
-                        break;
-                    }
-
-                    // If no publishers found, this must be a login message
-                    if (pub_ptr == 0)
-                        new_client(server, fd);
-                }
-            }
-
-            // Process write descriptors: subscribers awaiting more data and publisher acknowledgements
-            if (FD_ISSET(fd, &writefds))
-            {
-                if (sub_ptr = get_subscriber(server, fd))
-                {
-                    // Send message to subscriber
-                    switch (send_msg(get_subscriber(server, fd)))
-                    {
-                    case 1:
-                        FD_SET(fd, &next_writefds);
-                        next_fdm = MAX(next_fdm, fd);
-                        break;
-                    case 0:
-                        //close(fd);
-                        break;
-                    case -1:
-                        // close fd and recycle subscriber.
-                        break;
-                    }
-                }
-                else
-                {
-                    // Send ACK to publisher
-                    pub_ptr = get_publisher(server, fd);
-                    if (send_ack(pub_ptr))
-                    {
-                        // close the fd and recycle the publisher. but for now...
-                        fprintf(stderr, "Dodgy read error. Exiting...\n");
-                        return 1;
-                    }
-                }
-            }
+            log_error("Async request failed: '%s' for socket: %d",
+                      strerror(-cqe->res), conn->socket);
+            return 1;
         }
 
-        // Add all publishers to the read file descriptor set
-        for (pub_ptr = server->publishers; pub_ptr; pub_ptr = pub_ptr->next)
+        if (cqe->res == 0)
         {
-            FD_SET(pub_ptr->fd, &next_readfds);
-            next_fdm = MAX(next_fdm, pub_ptr->fd);
+            log_info("Closed connection %d", conn->socket);
+            close(conn->socket);
+            io_uring_cqe_seen(server->ring, cqe);
+            // TODO: remove connection from server.connections or tombstone it
+            continue;
         }
+
+        switch (ctx->state)
+        {
+        case CONN_ACCEPT:
+            initialise_connection(conn, cqe->res, &their_addr);
+            prepare_accept(server, &their_addr, &their_addr_len);
+            read_from_start(server, conn);
+            break;
+        case CONN_READ:
+            {
+                size_t next_read = handle_read_response(server, conn, cqe->res);
+                if (next_read > 0)
+                    prepare_recv(server, conn, conn->read_buf->buf + conn->read_buf->len - next_read, next_read);
+                else
+                    read_from_start(server, conn);
+                break;
+            }
+        case CONN_WRITE:
+            {
+                uint32_t next_write = handle_write_response(server, conn, cqe->res);
+                if (next_write)
+                    prepare_write(server, conn, conn->write_buf->buf + conn->bytes_w, next_write);
+                else
+                    dequeue_publish(server, conn);
+            }
+            break;
+        }
+
+        io_uring_cqe_seen(server->ring, cqe);
+    }
+}
+
+void memo_free_server(memo_server_s *server)
+{
+    for (subscription_s *ptr = server->subscriptions; ptr; ptr = server->subscriptions)
+    {
+        if (ptr)
+            server->subscriptions = ptr->next;
+        free_subscription(ptr);
     }
 
-    return 0;
+    for (connection_s *ptr = server->connections; ptr; ptr = server->connections)
+    {
+        if (ptr)
+            server->connections = ptr->next_r;
+        free_connection(ptr);
+    }
+
+    if (server->ring != NULL)
+        io_uring_queue_exit(server->ring);
+    
+    close(server->listener);
+    free(server);
 }

@@ -14,6 +14,9 @@
 #include <sys/fcntl.h>
 #include <sys/wait.h>
 #include <signal.h>
+#include <liburing.h>
+
+#include "memo.h"
 
 #define HEADER_LEN sizeof(uint32_t) // Header used to indicate size of msg to client
 #define LOGIN_LEN 64

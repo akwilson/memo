@@ -1,13 +1,13 @@
 BIN = memod
-SRCS = memod.c server.c
+SRCS = memod.c server.c logging.c
 
-BIN1 = memop
-SRCS1 = memop.c client.c publish.c
+#BIN1 = memop
+#SRCS1 = memop.c client.c publish.c
 
-BIN2 = memos
-SRCS2 = memos.c client.c subscribe.c
+#BIN2 = memos
+#SRCS2 = memos.c client.c subscribe.c
 
-# LIBS = -lxmlp
+LIBS = -luring
 BUILDDIR = build
 
 BIN_OUT = $(addprefix $(BUILDDIR)/, $(BIN))

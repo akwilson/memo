@@ -18,8 +18,6 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    printf("memod: waiting for connections...\n");
-
     rv = memo_process_server(server);
     memo_free_server(server);
 
