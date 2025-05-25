@@ -8,6 +8,7 @@ from memo_client import MemoClient
 
 MEMO_HOST = "localhost"
 MEMO_PORT = 5000
+DATA_FILE = "./test/lorem_6k.txt"
 
 def run_threads(*targets):
     """Start and join a list of thread target functions."""
@@ -34,7 +35,7 @@ def memo_server(request):
     if getattr(request, "param", None) == "partial_write":
         env["MEMO_PARTIAL_WRITE"] = "Y"
     proc = subprocess.Popen(
-        ["../build/memod", f"{MEMO_PORT}"],
+        ["./build/memod", f"{MEMO_PORT}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env)
@@ -143,7 +144,7 @@ def test_multi_message_write(memo_server):
     as a single lump of data on the Memo server.
     """
     received = []
-    with open("lorem_6k.txt", "rb") as f:
+    with open(DATA_FILE, "rb") as f:
         file_data = f.read()
 
     def subscriber():
@@ -174,7 +175,7 @@ def test_large_write_pw(memo_server):
     in order to test how the event loop handles that situation.
     """
     received = []
-    with open("lorem_6k.txt", "rb") as f:
+    with open(DATA_FILE, "rb") as f:
         file_data = f.read()
 
     def subscriber():

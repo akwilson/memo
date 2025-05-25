@@ -1,5 +1,24 @@
 # Memo
 
-A very simple publish / subscribe broker in C.
+A publish / subscribe broker written in C.
 
-Start up the server program and use the subscriber to listen for messages on a topic. Use the publisher to send messages to the topic and watch them appear in the subscribers.
+## Build
+
+Because Memo uses io_uring it is only supported on Linux.
+```sh
+$ sudo apt install luburing-dev
+```
+
+```sh
+# Build it
+$ make
+
+# Run the Python tests
+$ make test
+```
+
+## Run
+Run the Memo server on port 5000
+```sh
+$ ./build/memod 5000
+```

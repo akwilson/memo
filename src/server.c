@@ -344,7 +344,6 @@ static bool get_env_partial_writes()
  */
 static void prepare_write(memo_server_s *server, connection_s *dest, void *buf, size_t length)
 {
-    static bool do_partial_writes = false;
     struct io_uring_sqe *sqe = io_uring_get_sqe(server->ring);
 
     dest->write_op.conn = dest;
@@ -426,10 +425,10 @@ static void dequeue_publish(memo_server_s *server, connection_s *conn)
 /**
  * Publishes a message to any interested subscribers.
  *
- * @param `conn` the connection from which the message was received
- * @param `msg`  the message to send to any interested subscribers
+ * @param `server` the memo server instance
+ * @param `msg`    the message to send to any interested subscribers
  */
-static void publish_msg(memo_server_s *server, connection_s *conn, message_s *msg)
+static void publish_msg(memo_server_s *server, message_s *msg)
 {
     subscription_s *sub = find_subscription(server, msg->topic);
     if (!sub)
@@ -464,7 +463,7 @@ static void process_msg(memo_server_s *server, connection_s *conn, message_s *ms
         register_subscription(server, conn, msg->topic);
         break;
     case OP_PUBLISH:
-        publish_msg(server, conn, msg);
+        publish_msg(server, msg);
         break;
     }
 
@@ -480,7 +479,7 @@ static void process_msg(memo_server_s *server, connection_s *conn, message_s *ms
  */
 static data_buffer_slice_s try_process_messages(memo_server_s *server, connection_s *conn, data_buffer_slice_s slice)
 {
-    if (slice_len(slice) < HEADER_LEN || slice_len(slice) < msg_len(slice.start))
+    if (slice_len(slice) < MSG_HEADER_LEN || slice_len(slice) < msg_len(slice.start))
         return slice;
 
     message_s *msg = parse_msg(slice);
@@ -507,18 +506,17 @@ static data_buffer_slice_s try_process_messages(memo_server_s *server, connectio
  * buffer if it's not big enough or move the data back to the start of the buffer
  * if it is (or the size in unknown).
  *
- * @param `server` the memo server instance
  * @param `conn`   the connection, contains the buffer populated by `recv`
  * @param `slice`  points to the unhandled data
  *
  * @returns the amount of data to request in the next `recv` call
  */
-static size_t prepare_next_read(memo_server_s *server, connection_s *conn, data_buffer_slice_s slice)
+static size_t prepare_next_read(connection_s *conn, data_buffer_slice_s slice)
 {
     ptrdiff_t unhandled_len = slice_len(slice);
 
     // Scenario 1: we're gonna need a bigger boat
-    if (unhandled_len > HEADER_LEN && msg_len(slice.start) > conn->read_buf->len)
+    if (unhandled_len > MSG_HEADER_LEN && msg_len(slice.start) > conn->read_buf->len)
     {
         size_t new_buf_len = max(msg_len(slice.start), DEFAULT_MSG_LEN);
         data_buffer_s *new_buf = calloc(1, sizeof(data_buffer_s) + new_buf_len);
@@ -559,7 +557,7 @@ static size_t handle_read_response(memo_server_s *server, connection_s *conn, si
     };
 
     data_buffer_slice_s remaining = try_process_messages(server, conn, slice);
-    return slice_len(remaining) ? prepare_next_read(server, conn, remaining) : 0;
+    return slice_len(remaining) ? prepare_next_read(conn, remaining) : 0;
 }
 
 /**
@@ -571,7 +569,7 @@ static size_t handle_read_response(memo_server_s *server, connection_s *conn, si
  *
  * @returns the number of bytes to be sent in the next call, 0 if completed
  */
-static size_t handle_write_response(memo_server_s *server, connection_s *conn, size_t bytes_written)
+static size_t handle_write_response(connection_s *conn, size_t bytes_written)
 {
     conn->bytes_w += bytes_written;
     if (conn->bytes_w == conn->write_buf->len)
@@ -703,7 +701,7 @@ int memo_process_server(memo_server_s *server)
             }
         case CONN_WRITE:
             {
-                uint32_t next_write = handle_write_response(server, conn, cqe->res);
+                uint32_t next_write = handle_write_response(conn, cqe->res);
                 if (next_write)
                     prepare_write(server, conn, conn->write_buf->buf + conn->bytes_w, next_write);
                 else
