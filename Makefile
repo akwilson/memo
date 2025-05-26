@@ -1,8 +1,8 @@
 BIN1 = memod
 BIN1_SRCS = memod.c server.c logging.c
 
-#BIN2 = memo
-#BIN2_SRCS = cli.c
+BIN2 = memo
+BIN2_SRCS = cli.c client.c
 
 LIBS = -luring
 

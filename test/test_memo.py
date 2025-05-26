@@ -55,7 +55,7 @@ def test_pub_sub_round_trip(memo_server):
     """The most basic test: subscribe and publish to a topic, all in the same process."""
     received = []
 
-    def handle_news(topic, body):
+    def handle_news(client, topic, body):
         received.append((topic, body.decode()))
 
     with MemoClient() as client:
@@ -72,12 +72,12 @@ def test_pub_sub_multiple_subscribers(memo_server):
 
     def subscriber1():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received_1.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received_1.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def subscriber2():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received_2.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received_2.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def publisher():
@@ -99,7 +99,7 @@ def test_two_part_write(memo_server):
 
     def subscriber():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def publisher():
@@ -123,7 +123,7 @@ def test_two_part_write_two(memo_server):
 
     def subscriber():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def publisher():
@@ -149,7 +149,7 @@ def test_multi_message_write(memo_server):
 
     def subscriber():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def publisher():
@@ -180,7 +180,7 @@ def test_large_write_pw(memo_server):
 
     def subscriber():
         with MemoClient() as client:
-            client.subscribe("news", lambda t, b: received.append((t, b.decode())))
+            client.subscribe("news", lambda c, t, b: received.append((t, b.decode())))
             client.listen(timeout=1.0)
 
     def publisher():

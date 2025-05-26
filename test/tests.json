@@ -1,9 +1,0 @@
-[{
-    "name" : "test1",
-    "subscribers" : [ "TEST", "TEST", "TEST2" ],
-    "publish" : [
-        { "topic" : "TEST", "message" : "hohoho" },
-        { "topic" : "TEST", "message" : "quit" },
-        { "topic" : "TEST2", "message" : "quit" }
-    ]
-}]

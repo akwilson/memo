@@ -80,7 +80,7 @@ class MemoClient:
                 body = payload[65:]
                 callback = self.callbacks.get(topic)
                 if callback:
-                    callback(topic, body)
+                    callback(self, topic, body)
                 else:
                     print(f"[WARN] No callback registered for topic '{topic}'")
         except socket.timeout:
