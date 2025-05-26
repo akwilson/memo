@@ -583,7 +583,7 @@ static size_t handle_write_response(connection_s *conn, size_t bytes_written)
     return conn->write_buf->len - conn->bytes_w;
 }
 
-memo_server_s *memo_start_server(char *port)
+memo_server_s *memo_server_init(const char *port)
 {
     int             sockfd;
     int             yes = 1;
@@ -648,7 +648,7 @@ memo_server_s *memo_start_server(char *port)
     return svr;
 }
 
-int memo_process_server(memo_server_s *server)
+int memo_server_process(memo_server_s *server)
 {
     struct io_uring_cqe *cqe;
     struct sockaddr_storage their_addr;
@@ -714,7 +714,7 @@ int memo_process_server(memo_server_s *server)
     }
 }
 
-void memo_free_server(memo_server_s *server)
+void memo_server_free(memo_server_s *server)
 {
     for (subscription_s *ptr = server->subscriptions; ptr; ptr = server->subscriptions)
     {
