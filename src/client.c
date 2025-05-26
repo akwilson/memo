@@ -1,4 +1,5 @@
 #include <pwd.h>
+#include <assert.h>
 #include "memo_int.h"
 
 /**
@@ -55,11 +56,11 @@ static int server_login(int sockfd, char* topic)
 // topic is not null a subscriber connection is made, otherwise a publisher.
 static int connect_client(const char *host, const char *port)
 {
-    int              sockfd;
-    struct addrinfo  hints;
-    struct addrinfo* servinfo;
-    struct addrinfo* p;
-    int              rv;
+    int             sockfd;
+    struct addrinfo hints;
+    struct addrinfo *servinfo;
+    struct addrinfo *p;
+    int             rv;
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -98,7 +99,10 @@ static int connect_client(const char *host, const char *port)
     return sockfd;
 }
 
-static int verify_publish(memo_client_s *mc, const char *topic)
+/**
+ * Check that the data passed in from the user is valid.
+ */
+static int verify_memo_params(memo_client_s *mc, const char *topic)
 {
     if (mc == NULL || mc->socket == 0)
     {
@@ -115,12 +119,12 @@ static int verify_publish(memo_client_s *mc, const char *topic)
     return 0;
 }
 
-static data_buffer_s *pack_client_msg(msg_type_e type, const char *topic, const char *msg, size_t len)
+static data_buffer_s *pack_client_msg(msg_type_e type, const char *topic, const uint8_t *msg, size_t len)
 {
-    uint32_t msg_size = len + MSG_HEADER_LEN;
-    data_buffer_s *rv = calloc(1, sizeof(data_buffer_s) + msg_size);
-    rv->len = msg_size;
-    memcpy(rv->buf, &msg_size, sizeof(uint32_t));
+    uint32_t msg_len = len + MSG_HEADER_LEN;
+    data_buffer_s *rv = calloc(1, sizeof(data_buffer_s) + msg_len);
+    rv->len = msg_len;
+    memcpy(rv->buf, &msg_len, sizeof(uint32_t));
 
     size_t offset = sizeof(uint32_t);
     memcpy(rv->buf + offset, &type, sizeof(uint8_t));
@@ -129,10 +133,27 @@ static data_buffer_s *pack_client_msg(msg_type_e type, const char *topic, const 
     int topic_len = strlen(topic);
     memcpy(rv->buf + offset, topic, topic_len);
 
-    offset += TOPIC_LEN;
-    memcpy(rv->buf + offset, msg, msg_size - offset);
+    if (msg != NULL)
+    {
+        offset += TOPIC_LEN;
+        memcpy(rv->buf + offset, msg, msg_len - offset);
+    }
 
     return rv;
+}
+
+static topic_handler_s *lookup_handler(memo_client_s *mc, const char *topic)
+{
+    topic_handler_s *th;
+    for (th = mc->handlers; th; th = th->next)
+    {
+	if (!memcmp(th->topic, topic, TOPIC_LEN))
+	{
+	    break;
+	}
+    }
+
+    return th;
 }
 
 memo_client_s *memo_client_init(const char* hostname, const char *port)
@@ -143,22 +164,105 @@ memo_client_s *memo_client_init(const char* hostname, const char *port)
 
     memo_client_s *rv = malloc(sizeof(memo_client_s));
     rv->socket = socket;
+    rv->handlers = NULL;
     return rv;
 }
 
-int memo_client_pub(memo_client_s *mc, const char *topic, const char *msg, size_t len)
+int memo_client_pub(memo_client_s *mc, const char *topic, const uint8_t *msg, size_t len)
 {
-    if (verify_publish(mc, topic))
+    if (verify_memo_params(mc, topic))
         return 1;
 
     data_buffer_s *buf = pack_client_msg(OP_PUBLISH, topic, msg, len);
-    send_msg(mc->socket, buf);
+    int sent = send_msg(mc->socket, buf);
+    return buf->len - sent;
+}
 
-    return 0;
+int memo_client_sub(memo_client_s *mc, const char *topic, memo_callback callback)
+{
+    if (verify_memo_params(mc, topic))
+        return 1;
+
+    data_buffer_s *buf = pack_client_msg(OP_SUBSCRIBE, topic, NULL, 0);
+    int sent = send_msg(mc->socket, buf);
+
+    topic_handler_s *th = calloc(1, sizeof(topic_handler_s));
+    strcpy(th->topic, topic); // TODO: danger
+    th->callback = callback;
+    th->next = mc->handlers;
+    mc->handlers = th;
+
+    return buf->len - sent;
+}
+
+void memo_client_listen(memo_client_s *mc)
+{
+    uint32_t msg_len;
+    uint32_t received;
+    int      num_bytes;
+
+    while (1)
+    {
+        num_bytes = recv(mc->socket, &msg_len, sizeof(uint32_t), 0);
+        if (num_bytes == 0)
+            goto DISCONNECT;
+
+        if (num_bytes < 0)
+            goto ERROR;
+
+        uint8_t *raw_data = malloc(msg_len);
+        memcpy(raw_data, &msg_len, num_bytes); 
+        received = num_bytes;
+
+        do
+        {
+            num_bytes = recv(mc->socket, raw_data + received, msg_len - received, 0);
+            if (num_bytes == 0)
+                goto DISCONNECT;
+
+            if (num_bytes < 0)
+                goto ERROR;
+
+            received += num_bytes;
+        } while (received < msg_len);
+
+        memo_msg_s msg_view =
+        {
+            .topic = (const char *)(raw_data + sizeof(uint32_t) + sizeof(uint8_t)),
+            .body = raw_data + MSG_HEADER_LEN,
+            .body_len = msg_len - MSG_HEADER_LEN,
+            .raw_data = raw_data,
+        };
+
+        topic_handler_s *handler = lookup_handler(mc, msg_view.topic);
+        assert(handler != 0);
+        handler->callback(mc, msg_view);
+    }
+
+ DISCONNECT:
+    fprintf(stderr, "Connection to Memo server lost\n");
+    return;
+
+ ERROR:
+    perror("recv");
+    return;
+}
+
+void memo_msg_free(memo_msg_s msg)
+{
+    free((uint8_t *)msg.raw_data);
 }
 
 void memo_client_free(memo_client_s *mc)
 {
     close(mc->socket);
+
+    for (topic_handler_s *ptr = mc->handlers; ptr; ptr = mc->handlers)
+    {
+        if (ptr)
+            mc->handlers = ptr->next;
+        free(ptr);
+    }
+    
     free(mc);
 }

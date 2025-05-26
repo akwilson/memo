@@ -3,7 +3,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "memo_int.h"
+#include "memo.h"
 
 #define shift(argc, argv) (assert((argc) > 0), --(argc), *(argv)++)
 
@@ -21,39 +21,39 @@ static void usage(const char *msg)
     exit(1);
 }
 
-/*
-static void handler(memo_client_s *mc, const char *topic, const char *msg, size_t len)
+static void handler(memo_client_s *mc, memo_msg_s msg)
 {
-    printf("%s: %s\n", topic, msg);
+    (void)mc; // unused
+    printf("%s: %.*s\n", msg.topic, (int)msg.body_len, (char *)msg.body);
+    memo_msg_free(msg);
 }
-*/
 
 static int subscriber(int argc, char *argv[])
 {
     const char *next_arg = shift(argc, argv);
-    // const char *hostname = shift(argc, argv);
-    // const char *port = shift(argc, argv);
-
-    if (argc == 0)
+    if (argc < 3)
     {
-        usage("sub: [topics]");
+        usage("sub: <hostname> <port> [topics]");
     }
 
-    /*
+    const char *hostname = shift(argc, argv);
+    const char *port = shift(argc, argv);
+
     memo_client_s *mc = memo_client_init(hostname, port);
     if (mc == NULL)
         return 1;
-    */
 
     while (argc)
     {
         next_arg = shift(argc, argv);
-        printf("subscribing to %s\n", next_arg);
-        // memo_client_sub(mc, next_arg, handler);
+        if (memo_client_sub(mc, next_arg, handler))
+            return 1;
+        printf("Subscribed to '%s'\n", next_arg);
     }
 
-    // memo_client_listen(mc);
-    // memo_client_free(mc);
+    printf("Listening for messages from Memo...\n");
+    memo_client_listen(mc);
+    memo_client_free(mc);
 
     return 0;
 }
@@ -74,7 +74,7 @@ static int publisher(int argc, char *argv[])
     if (mc == NULL)
         return 1;
 
-    if (memo_client_pub(mc, topic, msg, len))
+    if (memo_client_pub(mc, topic, (const uint8_t *)msg, len))
         return 1;
 
     memo_client_free(mc);

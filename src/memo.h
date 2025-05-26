@@ -1,18 +1,28 @@
 #pragma once
 
+#include <stdint.h>
+
 typedef struct memo_server memo_server_s;
 
 typedef struct memo_client memo_client_s;
 
+typedef struct memo_msg
+{
+    const char    *topic;
+    const uint8_t *body;
+    size_t        body_len;
+
+    // private
+    const uint8_t *raw_data;
+} memo_msg_s;
+
 /**
  * A callback to a subscription message handler function.
  *
- * @param `client`  the Memo client that received the message
- * @param `topic`   the topic the message was received on
- * @param `message` the message received
- * @param `len`     length of the message
+ * @param `client` the Memo client that received the message
+ * @param `msg`    the memo message received
  */
-typedef void (*memo_callback)(memo_client_s *client, const char *topic, const void *message, size_t len);
+typedef void (*memo_callback)(memo_client_s *client, memo_msg_s msg);
 
 /**
  * Initialises and sets up the socket for a new Memo server.
@@ -55,8 +65,10 @@ memo_client_s *memo_client_init(const char *hostname, const char *port);
  * @param `client`   the client with the connection to a Memo server
  * @param `topic`    the topic to register the subscription against
  * @param `callback` function to be called when a message is received
+ *
+ * @returns 0 if successful, non-zero otherwise
  */
-void memo_client_sub(memo_client_s *client, const char *topic, memo_callback callback);
+int memo_client_sub(memo_client_s *client, const char *topic, memo_callback callback);
 
 /**
  * Publishes a message to a Memo server.
@@ -68,7 +80,7 @@ void memo_client_sub(memo_client_s *client, const char *topic, memo_callback cal
  *
  * @returns 0 if successful, non-zero otherwise
  */
-int memo_client_pub(memo_client_s *client, const char *topic, const char *message, size_t len);
+int memo_client_pub(memo_client_s *client, const char *topic, const uint8_t *message, size_t len);
 
 /**
  * Starts the event loop, listening to messages from the server and dispatching callbacks.
@@ -76,6 +88,13 @@ int memo_client_pub(memo_client_s *client, const char *topic, const char *messag
  * @param `client` the client with the connection to a Memo server
  */
 void memo_client_listen(memo_client_s *client);
+
+/**
+ * Free a memo message.
+ *
+ * @params `msg` the Memo message to be freed
+ */
+void memo_msg_free(memo_msg_s msg);
 
 /**
  * Disconnects the client from the Memo server and frees its allocated resources.

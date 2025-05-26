@@ -31,9 +31,20 @@ typedef enum msg_type
     OP_CLOSE     = 0x08
 } msg_type_e;
 
+/**
+ * Maps a topic to a message handler callback.
+ */
+typedef struct topic_handler
+{
+    char                 topic[TOPIC_LEN];
+    memo_callback        callback;
+    struct topic_handler *next;
+} topic_handler_s;
+
 struct memo_client
 {
-    int socket;
+    int             socket;
+    topic_handler_s *handlers;
 };
 
 /**
