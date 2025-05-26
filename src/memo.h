@@ -65,8 +65,10 @@ void memo_client_sub(memo_client_s *client, const char *topic, memo_callback cal
  * @param `topic`   the topic the message should be sent against
  * @param `message` the message to send
  * @param `len`     the message length
+ *
+ * @returns 0 if successful, non-zero otherwise
  */
-void memo_client_pub(memo_client_s *client, const char *topic, const char *message, size_t len);
+int memo_client_pub(memo_client_s *client, const char *topic, const char *message, size_t len);
 
 /**
  * Starts the event loop, listening to messages from the server and dispatching callbacks.

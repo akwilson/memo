@@ -6,8 +6,6 @@
 #define BACKLOG 10 // Number of pending connections the queue will hold.
 #define QUEUE_DEPTH 256
 #define MSG_QUEUE_SIZE 32
-#define TOPIC_LEN 64
-#define MSG_HEADER_LEN (4 + 1 + TOPIC_LEN)
 #define DEFAULT_MSG_LEN 4096
 #define PARTIAL_MSG_LEN 72
 
@@ -25,26 +23,6 @@ typedef enum
     CONN_READ,
     CONN_WRITE
 } conn_state_e;
-
-/**
- * Messages incoming or outgoing are of one of these types.
- */
-enum
-{
-    OP_PUBLISH   = 0x01,
-    OP_SUBSCRIBE = 0x02,
-    OP_ADMIN     = 0x04,
-    OP_CLOSE     = 0x08
-};
-
-/**
- * An incomming message from a client process.
- */
-typedef struct
-{
-    size_t  len;
-    uint8_t buf[];
-} data_buffer_s;
 
 /**
  * A slice of data within a `data_buffer_s`.

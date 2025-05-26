@@ -1,42 +1,32 @@
 #include <pwd.h>
 #include "memo_int.h"
 
-// get sockaddr, IPv4 or IPv6
-static void* get_in_addr(struct sockaddr* sa)
+/**
+ * Writes a message to a file descriptior representing a Memo server. Loops if
+ * neccessary until the whole message is sent.
+ *
+ * @param `socket` the socket representing the connection to the Memo server
+ * @param `buf`    the message to be sent
+ *
+ * @returns the number of bytes actually sent
+ */
+static int send_msg(int socket, data_buffer_s *buf)
 {
-    if (sa->sa_family == AF_INET)
-    {
-        return &(((struct sockaddr_in*)sa)->sin_addr);
-    }
-
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
-}
-
-// Writes a message to a file descriptior representing a Memo server. Loops if
-// neccessary until the whole message is sent.
-// msg is the message to be sent, len the message length.
-// Returns the total number of bytes actually sent.
-static int send_msg(int socket, char* msg, int* len)
-{
-    int   sent = 0;
-    int   rv = 0;
-    char* msg_buf = msg;
-    int   tot_len = *len;
-
+    uint32_t sent = 0;
     do
     {
-        rv = send(socket, msg_buf + sent, tot_len - sent, 0);
+        int rv = send(socket, buf->buf + sent, buf->len - sent, 0);
         if (rv == -1)
             break;
         sent += rv;
-    } while (sent < tot_len);
+    } while (sent < buf->len);
 
-    *len = sent; // return total bytes sent
-    return (rv == -1) ? 1 : 0;
+    return sent;
 }
 
 // Sends a login message to the server to register a new connection. If the
 // client is a subscriber the topic should be not null.
+/*
 static int server_login(int sockfd, char* topic)
 {
     char data[LOGIN_LEN];
@@ -59,17 +49,17 @@ static int server_login(int sockfd, char* topic)
 
     return send_msg(sockfd, data, &len);
 }
+*/
 
 // Establishes a new client connection to the Memo server on host / port. If
 // topic is not null a subscriber connection is made, otherwise a publisher.
-int connect_client(char* host, char* port, char* topic)
+static int connect_client(const char *host, const char *port)
 {
     int              sockfd;
     struct addrinfo  hints;
     struct addrinfo* servinfo;
     struct addrinfo* p;
     int              rv;
-    char             s[INET6_ADDRSTRLEN];
 
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_UNSPEC;
@@ -86,32 +76,89 @@ int connect_client(char* host, char* port, char* topic)
     {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
         {
-            perror("Error: connect socket");
             continue;
         }
 
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) == -1)
+        if (connect(sockfd, p->ai_addr, p->ai_addrlen) != -1)
         {
-            perror("Error: connect connect");
-            close(sockfd);
-            continue;
+            // Connected successfully
+            break;
         }
 
-        break;
+        close(sockfd);
     }
 
     if (p == NULL)
     {
-        fprintf(stderr, "Error: failed to connect\n");
+        fprintf(stderr, "Error: unable to connect to Memo server at '%s:%s'\n", host, port);
         return -1;
     }
 
-    inet_ntop(p->ai_family, get_in_addr((struct sockaddr *)p->ai_addr), s, sizeof s);
-
-    freeaddrinfo(servinfo); // all done with this structure
-
-    if (server_login(sockfd, topic))
-        return 0;
-
+    freeaddrinfo(servinfo);
     return sockfd;
+}
+
+static int verify_publish(memo_client_s *mc, const char *topic)
+{
+    if (mc == NULL || mc->socket == 0)
+    {
+        fprintf(stderr, "Error: attempt to send message to unconnected client\n");
+        return 1;
+    }
+
+    if (strlen(topic) > TOPIC_LEN)
+    {
+        fprintf(stderr, "Topic length exceeds maximum of %d bytes\n", TOPIC_LEN);
+        return 1;
+    }
+
+    return 0;
+}
+
+static data_buffer_s *pack_client_msg(msg_type_e type, const char *topic, const char *msg, size_t len)
+{
+    uint32_t msg_size = len + MSG_HEADER_LEN;
+    data_buffer_s *rv = calloc(1, sizeof(data_buffer_s) + msg_size);
+    rv->len = msg_size;
+    memcpy(rv->buf, &msg_size, sizeof(uint32_t));
+
+    size_t offset = sizeof(uint32_t);
+    memcpy(rv->buf + offset, &type, sizeof(uint8_t));
+
+    offset += sizeof(uint8_t);
+    int topic_len = strlen(topic);
+    memcpy(rv->buf + offset, topic, topic_len);
+
+    offset += TOPIC_LEN;
+    memcpy(rv->buf + offset, msg, msg_size - offset);
+
+    return rv;
+}
+
+memo_client_s *memo_client_init(const char* hostname, const char *port)
+{
+    int socket = connect_client(hostname, port);
+    if (socket == -1)
+        return NULL;
+
+    memo_client_s *rv = malloc(sizeof(memo_client_s));
+    rv->socket = socket;
+    return rv;
+}
+
+int memo_client_pub(memo_client_s *mc, const char *topic, const char *msg, size_t len)
+{
+    if (verify_publish(mc, topic))
+        return 1;
+
+    data_buffer_s *buf = pack_client_msg(OP_PUBLISH, topic, msg, len);
+    send_msg(mc->socket, buf);
+
+    return 0;
+}
+
+void memo_client_free(memo_client_s *mc)
+{
+    close(mc->socket);
+    free(mc);
 }
