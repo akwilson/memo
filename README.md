@@ -42,13 +42,13 @@ $ ./build/memo pub localhost 5000 news "Breaking news!"
 #include <memo.h>
 
 /* Message handler called when a message is received */
-static int handle_news(memo_client_s *client, memo_msg_s msg)
+static int handle_news(memo_client_s *mc, memo_msg_s msg)
 {
     /* Do something imaginary with the message */
     const char *summary = summarise_story(msg);
     
     /* Publish a message to the 'news_summary' topic */
-    memo_client_publish(client, "news_summary", summary, strlen(summary));
+    memo_client_publish(mc, "news_summary", summary, strlen(summary));
     
     /* Free the message when done */
     memo_msg_free(msg);
@@ -57,7 +57,7 @@ static int handle_news(memo_client_s *client, memo_msg_s msg)
 int main()
 {
     /* Establish a connection to a memo server */
-    memo_client *mc = memo_client_init("localhost", 5000);
+    memo_client_s *mc = memo_client_init("localhost", "5000");
     
     /* Subscribe to the 'news' topic, calls back on the handle_news
        function when a message is received. */
