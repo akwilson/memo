@@ -32,5 +32,5 @@ $ ./build/memo sub localhost 5000 news
 
 And in yet another window publish some news
 ```sh
-$ ./build memo pub localhost 5000 news "Breaking news!"
+$ ./build/memo pub localhost 5000 news "Breaking news!"
 ```
