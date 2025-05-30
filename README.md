@@ -25,6 +25,7 @@ Run the Memo server on port 5000
 $ ./build/memod 5000
 ```
 
+## Connect from the command line
 In another terminal window setup up a subscriber to the `news` topic
 ```sh
 $ ./build/memo sub localhost 5000 news
@@ -33,4 +34,39 @@ $ ./build/memo sub localhost 5000 news
 And in yet another window publish some news
 ```sh
 $ ./build/memo pub localhost 5000 news "Breaking news!"
+```
+
+## Write your own program to connect
+```C
+#include <string.h>
+#include <memo.h>
+
+/* Message handler called when a message is received */
+static int handle_news(memo_client_s *client, memo_msg_s msg)
+{
+    /* Do something imaginary with the message */
+    const char *summary = summarise_story(msg);
+    
+    /* Publish a message to the 'news_summary' topic */
+    memo_client_publish(client, "news_summary", summary, strlen(summary));
+    
+    /* Free the message when done */
+    memo_msg_free(msg);
+}
+
+int main()
+{
+    /* Establish a connection to a memo server */
+    memo_client *mc = memo_client_init("localhost", 5000);
+    
+    /* Subscribe to the 'news' topic, calls back on the handle_news
+       function when a message is received. */
+    memo_client_subscribe(mc, "news", handle_news);
+    
+    /* Listen for messages and dispatch callback when received */
+    memo_client_listen(mc);
+    
+    /* Free the client connection */
+    memo_client_free(mc);
+}
 ```
