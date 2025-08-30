@@ -13,14 +13,22 @@ typedef struct memo_server memo_server_s;
 typedef struct memo_client memo_client_s;
 
 /**
- * A Memo message contains data received from the server.
+ * A Memo message contains data received from the server. This struct
+ * is a fat pointer to some byte array data received. `topic` and `body`
+ * point to positions within the byte array. Memo messages should be
+ * freed after use.
  */
 typedef struct memo_msg
 {
-    const char    *topic;    // the topic
-    const uint8_t *body;     // the actual message content
-    size_t        body_len;  // length of the message content
-    const uint8_t *raw_data; // private: internal use only
+    size_t        msg_len;  // total length of the message
+    uint8_t       type;     // memo message type
+    const char    *topic;   // the topic
+    const uint8_t *body;    // the actual message content
+    size_t        body_len; // length of the message content
+
+    // private: internal use only
+    uint8_t       *_raw_data;
+    uint32_t      *_header;
 } memo_msg_s;
 
 /**

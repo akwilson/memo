@@ -32,11 +32,10 @@ typedef enum msg_type
 } msg_type_e;
 
 /**
- * An message buffer to/from a client process.
+ * A fat pointer referencing some data held in a buffer.
  */
 typedef struct
 {
     size_t  len;
-    uint8_t buf[];
-} data_buffer_s;
-
+    uint8_t *ptr;
+} data_slice_s;

@@ -24,20 +24,20 @@ struct memo_client
  * neccessary until the whole message is sent.
  *
  * @param `socket` the socket representing the connection to the Memo server
- * @param `buf`    the message to be sent
+ * @param `slice`  the message to be sent
  *
  * @returns the number of bytes actually sent
  */
-static int send_msg(int socket, data_buffer_s *buf)
+static int send_msg(int socket, data_slice_s slice)
 {
     uint32_t sent = 0;
     do
     {
-        int rv = send(socket, buf->buf + sent, buf->len - sent, 0);
+        int rv = send(socket, slice.ptr + sent, slice.len - sent, 0);
         if (rv == -1)
             break;
         sent += rv;
-    } while (sent < buf->len);
+    } while (sent < slice.len);
 
     return sent;
 }
@@ -136,27 +136,33 @@ static int verify_memo_params(memo_client_s *mc, const char *topic)
     return 0;
 }
 
-static data_buffer_s *pack_client_msg(msg_type_e type, const char *topic, const uint8_t *msg, size_t len)
+static data_slice_s pack_client_msg(msg_type_e type, const char *topic, const uint8_t *msg, size_t len)
 {
     uint32_t msg_len = len + MSG_HEADER_LEN;
-    data_buffer_s *rv = calloc(1, sizeof(data_buffer_s) + msg_len);
-    rv->len = msg_len;
-    memcpy(rv->buf, &msg_len, sizeof(uint32_t));
+    uint8_t  *buf = calloc(1, msg_len);
+
+    memcpy(buf, &msg_len, sizeof(uint32_t));
 
     size_t offset = sizeof(uint32_t);
-    memcpy(rv->buf + offset, &type, sizeof(uint8_t));
+    memcpy(buf + offset, &type, sizeof(uint8_t));
 
     offset += sizeof(uint8_t);
     int topic_len = strlen(topic);
-    memcpy(rv->buf + offset, topic, topic_len);
+    memcpy(buf + offset, topic, topic_len);
 
     if (msg != NULL)
     {
         offset += TOPIC_LEN;
-        memcpy(rv->buf + offset, msg, msg_len - offset);
+        memcpy(buf + offset, msg, msg_len - offset);
     }
 
-    return rv;
+    data_slice_s slice =
+    {
+        .len = msg_len,
+        .ptr = buf
+    };
+
+    return slice;
 }
 
 static topic_handler_s *lookup_handler(memo_client_s *mc, const char *topic)
@@ -164,10 +170,8 @@ static topic_handler_s *lookup_handler(memo_client_s *mc, const char *topic)
     topic_handler_s *th;
     for (th = mc->handlers; th; th = th->next)
     {
-	if (!memcmp(th->topic, topic, TOPIC_LEN))
-	{
-	    break;
-	}
+        if (!memcmp(th->topic, topic, TOPIC_LEN))
+            break;
     }
 
     return th;
@@ -196,9 +200,9 @@ int memo_client_pub(memo_client_s *mc, const char *topic, const uint8_t *msg, si
     if (verify_memo_params(mc, topic))
         return 1;
 
-    data_buffer_s *buf = pack_client_msg(OP_PUBLISH, topic, msg, len);
-    int sent = send_msg(mc->socket, buf);
-    return buf->len - sent;
+    data_slice_s slice = pack_client_msg(OP_PUBLISH, topic, msg, len);
+    int sent = send_msg(mc->socket, slice);
+    return slice.len - sent;
 }
 
 int memo_client_sub(memo_client_s *mc, const char *topic, memo_callback callback)
@@ -206,8 +210,8 @@ int memo_client_sub(memo_client_s *mc, const char *topic, memo_callback callback
     if (verify_memo_params(mc, topic))
         return 1;
 
-    data_buffer_s *buf = pack_client_msg(OP_SUBSCRIBE, topic, NULL, 0);
-    int sent = send_msg(mc->socket, buf);
+    data_slice_s slice = pack_client_msg(OP_SUBSCRIBE, topic, NULL, 0);
+    int sent = send_msg(mc->socket, slice);
 
     topic_handler_s *th = calloc(1, sizeof(topic_handler_s));
     strcpy(th->topic, topic); // TODO: danger
@@ -215,7 +219,7 @@ int memo_client_sub(memo_client_s *mc, const char *topic, memo_callback callback
     th->next = mc->handlers;
     mc->handlers = th;
 
-    return buf->len - sent;
+    return slice.len - sent;
 }
 
 void memo_client_listen(memo_client_s *mc)
@@ -251,10 +255,12 @@ void memo_client_listen(memo_client_s *mc)
 
         memo_msg_s msg_view =
         {
+            .msg_len = msg_len,
             .topic = (const char *)(raw_data + sizeof(uint32_t) + sizeof(uint8_t)),
             .body = raw_data + MSG_HEADER_LEN,
             .body_len = msg_len - MSG_HEADER_LEN,
-            .raw_data = raw_data,
+            ._raw_data = raw_data,
+            ._header = NULL
         };
 
         topic_handler_s *handler = lookup_handler(mc, msg_view.topic);
@@ -273,7 +279,7 @@ void memo_client_listen(memo_client_s *mc)
 
 void memo_msg_free(memo_msg_s msg)
 {
-    free((uint8_t *)msg.raw_data);
+    free(msg._raw_data);
 }
 
 void memo_client_free(memo_client_s *mc)

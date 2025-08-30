@@ -39,10 +39,10 @@ $(BUILD_DIR)/%.o : $(SRC_DIR)/%.c
 
 all : dirs $(LIB1_OUT) $(BIN1_OUT) $(BIN2_OUT)
 
-$(BIN1_OUT) : $(BIN1_OBJS)
+$(BIN1_OUT) : $(BIN1_OBJS) $(LIB1_OUT).a
 	$(LINK.c) $^ -Wl,-Bstatic -L$(BUILD_DIR) $(SLIBS) -Wl,-Bdynamic $(DLIBS) -o $@
 
-$(BIN2_OUT) : $(BIN2_OBJS)
+$(BIN2_OUT) : $(BIN2_OBJS) $(LIB1_OUT).a
 	$(LINK.c) $^ -Wl,-Bstatic -L$(BUILD_DIR) $(SLIBS) -Wl,-Bdynamic $(DLIBS) -o $@
 
 $(LIB1_OUT) : $(LIB1_OUT).so $(LIB1_OUT).a
