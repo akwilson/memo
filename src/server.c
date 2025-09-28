@@ -37,6 +37,8 @@
  */
 
 #include <stddef.h>
+#include <signal.h>
+#include <sys/signalfd.h>
 
 #include "logging.h"
 #include "memo_int.h"
@@ -82,7 +84,8 @@ typedef enum
 {
     CONN_ACCEPT,
     CONN_READ,
-    CONN_WRITE
+    CONN_WRITE,
+    CONN_SIGNAL
 } conn_state_e;
 
 /**
@@ -143,9 +146,15 @@ typedef struct subscription
 struct memo_server
 {
     int                      listener;
+
+    int                      signalfd;
+    struct signalfd_siginfo  *siginfo;
+    op_context_s             signal_op;
+
     struct io_uring          *ring;
     connection_s             *connections;
     subscription_s           *subscriptions;
+
     struct io_uring_buf_ring *read_buf_ring;
     uint8_t                  *read_buf_base; // memory allocated for pool buffers + their headers
 };
@@ -321,12 +330,6 @@ static bool msg_queue_pop(message_queue_s *mq, memo_msg_s *msg)
     return true;
 }
 
-static void free_subscription(subscription_s *sub)
-{
-    free(sub->topic);
-    free(sub);
-}
-
 static void free_connection(connection_s *conn)
 {
     close(conn->socket);
@@ -340,6 +343,24 @@ static void free_connection(connection_s *conn)
 static inline uint8_t *find_buf(memo_server_s *server, uint32_t bid)
 {
     return server->read_buf_base + (bid * READ_BUF_SZE) + ((bid + 1) * sizeof(uint32_t));
+}
+
+/**
+ * Creates a file descriptor for handling kill signals. Will be fed in to the io_uring.
+ */
+static int setup_signal_fd()
+{
+    sigset_t set;
+
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+
+    if (sigprocmask(SIG_BLOCK, &set, NULL) == -1)
+        return -1;
+
+    int sfd = signalfd(-1, &set, SFD_CLOEXEC | SFD_NONBLOCK);
+    return sfd;
 }
 
 /**
@@ -362,6 +383,7 @@ static bool setup_read_buffers(memo_server_s *server)
     if (posix_memalign((void **)&br, READ_BUF_SZE, total_buf_size))
         return true;
 
+    memset(br, 0, total_buf_size);
     struct io_uring_buf_reg reg =
     {
         .ring_addr = (unsigned long)br,
@@ -432,6 +454,21 @@ static void initialise_connection(connection_s *conn, int socket, struct sockadd
 
     inet_ntop(their_addr->ss_family, get_in_addr((struct sockaddr *)their_addr), s, sizeof s);
     log_info("Accepted connection %d from %s", socket, s);
+}
+
+/**
+ * Sets up the signal file descriptor with the io_uring.
+ */
+static void prepare_signals(memo_server_s *server)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(server->ring);
+    io_uring_prep_read(sqe, server->signalfd, server->siginfo, sizeof(struct signalfd_siginfo), 0);
+
+    server->signal_op.conn = NULL;
+    server->signal_op.state = CONN_SIGNAL;
+    io_uring_sqe_set_data(sqe, &server->signal_op);
+
+    io_uring_submit(server->ring);
 }
 
 /**
@@ -761,6 +798,27 @@ static size_t prepare_next_read(memo_server_s *server, connection_s *conn, data_
 }
 
 /**
+ * Process a signal caught by the server's `signalfd`. Graceful shutdown
+ * should be handled from here.
+ *
+ * @returns `true` to indicate that the server should shut down, `false` otherwise
+ */
+static bool handle_signal(memo_server_s *server, size_t bytes_read)
+{
+    log_info("Caught signal. Shutting down.");
+    if (bytes_read == sizeof(struct signalfd_siginfo))
+    {
+        int signo = server->siginfo->ssi_signo;
+        if (signo == SIGINT || signo == SIGTERM)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
  * Processes a message received from `recv`. Parses and processes any complete
  * messages received and decides what to do with incomplete messages.
  *
@@ -877,6 +935,15 @@ memo_server_s *memo_server_init(const char *port)
     svr->ring = malloc(sizeof(struct io_uring));
     io_uring_queue_init(QUEUE_DEPTH, svr->ring, 0);
 
+    svr->signalfd = setup_signal_fd();
+    if (svr->signalfd == -1)
+    {
+        log_error("Failed to setup signal file descriptor");
+        return NULL;
+    }
+
+    svr->siginfo = calloc(1, sizeof(struct signalfd_siginfo));
+
     if (setup_read_buffers(svr))
     {
         log_error("Failed to setup read buffers");
@@ -888,12 +955,13 @@ memo_server_s *memo_server_init(const char *port)
 
 int memo_server_process(memo_server_s *server)
 {
-    struct io_uring_cqe *cqe;
-    struct sockaddr_storage their_addr;
-    socklen_t their_addr_len = sizeof(their_addr);
+    struct io_uring_cqe     *cqe;
+    struct sockaddr_storage their_addr = {0};
+    socklen_t               their_addr_len = sizeof(their_addr);
 
-    log_info("Memo Server ready");
     prepare_accept(server, &their_addr, &their_addr_len);
+    prepare_signals(server);
+    log_info("Memo Server ready");
 
     while (1)
     {
@@ -904,15 +972,14 @@ int memo_server_process(memo_server_s *server)
             return 1;
         }
 
-        op_context_s *ctx = (op_context_s *)cqe->user_data;
-        connection_s *conn = ctx->conn;
         if (cqe->res < 0)
         {
-            log_error("Async request failed: '%s' for socket: %d",
-                      strerror(-cqe->res), conn->socket);
+            log_error("Async request failed: '%s'", strerror(-cqe->res));
             return 1;
         }
 
+        op_context_s *ctx = (op_context_s *)cqe->user_data;
+        connection_s *conn = ctx->conn;
         if (cqe->res == 0)
         {
             log_info("Closed connection %d", conn->socket);
@@ -924,6 +991,11 @@ int memo_server_process(memo_server_s *server)
 
         switch (ctx->state)
         {
+        case CONN_SIGNAL:
+            if (handle_signal(server, cqe->res))
+                return 0;
+            prepare_signals(server);
+            break;
         case CONN_ACCEPT:
             initialise_connection(conn, cqe->res, &their_addr);
             prepare_accept(server, &their_addr, &their_addr_len);
@@ -959,7 +1031,7 @@ void memo_server_free(memo_server_s *server)
     {
         if (ptr)
             server->subscriptions = ptr->next;
-        free_subscription(ptr);
+        free(ptr);
     }
 
     for (connection_s *ptr = server->connections; ptr; ptr = server->connections)
@@ -970,8 +1042,17 @@ void memo_server_free(memo_server_s *server)
     }
 
     if (server->ring != NULL)
+    {
         io_uring_queue_exit(server->ring);
-    
-    close(server->listener);
+        io_uring_unregister_buf_ring(server->ring, READ_BUF_BID);
+
+        free(server->read_buf_ring);
+        close(server->listener);
+        close(server->signalfd);
+
+        free(server->siginfo);
+        free(server->ring);
+    }
+
     free(server);
 }
